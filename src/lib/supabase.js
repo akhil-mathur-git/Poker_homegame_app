@@ -43,12 +43,13 @@ export async function rpc(name, args) {
   if (error) throw error;
   return data;
 }
-export async function loadHomegame() {
+// Existing homegames SELECT RLS returns only memberships of auth.uid().
+export async function loadHomegames() {
   const { data, error } = await supabase
     .from("homegames")
-    .select("*")
-    .limit(1)
-    .maybeSingle();
+    .select("id,name,created_at")
+    .order("created_at")
+    .order("id");
   if (error) throw error;
   return data;
 }

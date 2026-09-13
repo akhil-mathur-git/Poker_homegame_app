@@ -502,3 +502,23 @@ figcaption {
     padding-top: 36px;
   }
 }
+
+.table-switcher {
+  flex: 1;
+  max-width: 260px;
+  min-width: 0;
+}
+.table-switcher select {
+  margin-top: 4px;
+  text-overflow: ellipsis;
+}
+.app-header {
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  .table-switcher {
+    order: 3;
+    flex-basis: 100%;
+    max-width: none;
+  }
+}

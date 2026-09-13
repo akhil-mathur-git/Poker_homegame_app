@@ -4,11 +4,16 @@ import {
   configurationError,
   ensureSession,
   loadData,
-  loadHomegame,
+  loadHomegames,
   rpc,
   supabase,
 } from "./lib/supabase.js";
 import { buildBackup, downloadJson, readLegacy } from "./lib/backup.js";
+import {
+  chooseHomegameId,
+  readSelectedHomegame,
+  rememberHomegame,
+} from "./lib/homegames.js";
 import { leaderboard } from "./lib/statistics.js";
 import { formatMoney } from "./calculations.js";
 import GameView from "./components/GameView.jsx";
@@ -48,7 +53,9 @@ function Setup() {
             Follow the project’s <code>README.md</code> setup guide.
           </li>
           <li>
-            Run <code>supabase/schema.sql</code> in Supabase.
+            For a new project, run <code>supabase/schema.sql</code>. For an
+            existing project, follow the migration steps in{" "}
+            <code>README.md</code>.
           </li>
           <li>
             Copy <code>.env.example</code> to <code>.env.local</code> and add
@@ -76,8 +83,8 @@ function Onboarding({ run, busy, onJoined }) {
         onSubmit={(e) => {
           e.preventDefault();
           run(async () => {
-            await rpc("join_homegame_by_code", { p_code: code });
-            await onJoined();
+            const id = await rpc("join_homegame_by_code", { p_code: code });
+            await onJoined(id);
           });
         }}
       >
@@ -103,8 +110,8 @@ function Onboarding({ run, busy, onJoined }) {
         onSubmit={(e) => {
           e.preventDefault();
           run(async () => {
-            await rpc("create_homegame", { p_name: name });
-            await onJoined();
+            const id = await rpc("create_homegame", { p_name: name });
+            await onJoined(id);
           });
         }}
       >
@@ -278,8 +285,9 @@ function Settings({ homegame, run, busy }) {
       <section className="card">
         <h2>Backup</h2>
         <p className="muted">
-          Download all players and completed games, with their saved results and
-          payments. Active games and invite codes are excluded.
+          Download players and completed games for {homegame.name}, with their
+          saved results and payments. Active games and invite codes are
+          excluded.
         </p>
         <button
           disabled={busy}
@@ -288,7 +296,7 @@ function Settings({ homegame, run, busy }) {
               const latest = await loadData(homegame.id);
               downloadJson(
                 buildBackup(homegame, latest),
-                `poker-homegame-backup-${today()}.json`,
+                `poker-homegame-backup-${homegame.id}-${today()}.json`,
               );
             })
           }
@@ -319,9 +327,8 @@ function Settings({ homegame, run, busy }) {
     </>
   );
 }
-export default function App() {
-  const [homegame, setHomegame] = useState(null),
-    [data, setData] = useState(emptyData),
+function HomegameApp({ homegame, homegames, onSelect }) {
+  const [data, setData] = useState(emptyData),
     [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
@@ -339,18 +346,11 @@ export default function App() {
     if (!homegame) return;
     const sequence = ++request.current;
     const next = await loadData(homegame.id);
-    if (sequence === request.current) setData(next);
-  }, [homegame]);
-  const initialize = useCallback(async () => {
-    await ensureSession();
-    const group = await loadHomegame();
-    if (group) {
-      const next = await loadData(group.id);
+    if (sequence === request.current) {
       setData(next);
+      setLoading(false);
     }
-    setHomegame(group);
-    setLoading(false);
-  }, []);
+  }, [homegame]);
   const run = useCallback(async (fn) => {
     if (operation.current) return;
     operation.current = true;
@@ -366,17 +366,10 @@ export default function App() {
     }
   }, []);
   useEffect(() => {
-    if (!supabase) return;
     let alive = true;
-    ensureSession()
-      .then(async () => {
-        const group = await loadHomegame();
-        const next = group ? await loadData(group.id) : emptyData;
-        if (alive) {
-          setHomegame(group);
-          setData(next);
-          setLoading(false);
-        }
+    refresh()
+      .then(() => {
+        if (alive) setLoading(false);
       })
       .catch((e) => {
         if (alive) {
@@ -386,13 +379,15 @@ export default function App() {
       });
     return () => {
       alive = false;
+      request.current += 1;
     };
-  }, [initialize]);
+  }, [refresh]);
   useEffect(() => {
     if (!homegame || !supabase) return;
     let timer,
       alive = true;
     const update = () => {
+      if (!alive) return;
       clearTimeout(timer);
       timer = setTimeout(
         () =>
@@ -403,7 +398,9 @@ export default function App() {
       );
     };
     const channel = supabase
-      .channel(`homegame-${homegame.id}`)
+      // A unique topic avoids reusing a channel still awaiting unsubscribe
+      // when StrictMode or a fast A → B → A switch remounts this table.
+      .channel(`homegame-${homegame.id}-${crypto.randomUUID()}`)
       .on(
         "postgres_changes",
         {
@@ -491,6 +488,20 @@ export default function App() {
             Poker Homegame<small>{homegame?.name || "Your shared table"}</small>
           </span>
         </button>
+        <TableSwitcher
+          homegames={homegames}
+          selectedId={homegame.id}
+          disabled={busy}
+          onSelect={(id) => {
+            if (operation.current) return;
+            if (
+              unsaved.current &&
+              !window.confirm("Switch tables? Unsaved inputs will be lost.")
+            )
+              return;
+            onSelect(id);
+          }}
+        />
         {homegame && (
           <button
             aria-label="Settings and invite"
@@ -521,10 +532,7 @@ export default function App() {
       {error && (
         <div className="error" role="alert">
           <p>{error}</p>
-          <button
-            disabled={busy}
-            onClick={() => run(homegame ? refresh : initialize)}
-          >
+          <button disabled={busy} onClick={() => run(refresh)}>
             Retry loading
           </button>
         </div>
@@ -534,8 +542,6 @@ export default function App() {
           <section className="empty" role="status">
             Connecting to your homegame…
           </section>
-        ) : !homegame ? (
-          <Onboarding run={run} busy={busy} onJoined={initialize} />
         ) : (
           <>
             {view === "home" && (
@@ -688,6 +694,148 @@ export default function App() {
             </button>
           ))}
         </nav>
+      )}
+    </div>
+  );
+}
+
+function TableSwitcher({ homegames, selectedId, disabled, onSelect }) {
+  return (
+    <label className="table-switcher">
+      Your tables
+      <select
+        aria-label="Selected homegame"
+        value={selectedId ?? ""}
+        disabled={disabled}
+        onChange={(e) => onSelect(e.target.value)}
+      >
+        <option value="" disabled>
+          Select a table
+        </option>
+        {homegames.map((group) => (
+          <option key={group.id} value={group.id}>
+            {group.name}
+          </option>
+        ))}
+        <option value="create">+ Create homegame</option>
+        <option value="join">+ Join homegame</option>
+      </select>
+    </label>
+  );
+}
+
+export default function App() {
+  const [homegames, setHomegames] = useState([]);
+  const [selectedHomegameId, setSelectedHomegameId] = useState(null);
+  const [managing, setManaging] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const operation = useRef(false);
+  const select = (id) => {
+    if (id === "create" || id === "join") {
+      setManaging(true);
+      return;
+    }
+    const validId = chooseHomegameId(homegames, id);
+    rememberHomegame(validId);
+    setSelectedHomegameId(validId);
+    setManaging(false);
+    setError("");
+    window.scrollTo(0, 0);
+  };
+  const initialize = async (preferredId) => {
+    await ensureSession();
+    const groups = await loadHomegames();
+    const id = chooseHomegameId(groups, preferredId ?? readSelectedHomegame());
+    setHomegames(groups);
+    setSelectedHomegameId(id);
+    rememberHomegame(id);
+    setManaging(false);
+    setLoading(false);
+  };
+  const run = async (fn) => {
+    if (operation.current) return;
+    operation.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await fn();
+    } catch (e) {
+      setError(friendly(e));
+    } finally {
+      operation.current = false;
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    if (!supabase) return;
+    let alive = true;
+    ensureSession()
+      .then(loadHomegames)
+      .then((groups) => {
+        if (!alive) return;
+        const id = chooseHomegameId(groups, readSelectedHomegame());
+        setHomegames(groups);
+        setSelectedHomegameId(id);
+        rememberHomegame(id);
+        setLoading(false);
+      })
+      .catch((e) => {
+        if (alive) {
+          setError(friendly(e));
+          setLoading(false);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  if (!supabase) return <Setup />;
+  const selected = homegames.find((group) => group.id === selectedHomegameId);
+  // A new key gives each table its own lifecycle: no drafts, invite state, fetch
+  // responses or subscriptions from the previous table can enter the next one.
+  if (selected && !managing)
+    return (
+      <HomegameApp
+        key={selected.id}
+        homegame={selected}
+        homegames={homegames}
+        onSelect={select}
+      />
+    );
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <span className="brand">
+          <span className="brand-symbol">♠</span>Poker Homegame
+        </span>
+        {homegames.length > 0 && (
+          <TableSwitcher
+            homegames={homegames}
+            selectedId={null}
+            disabled={busy}
+            onSelect={select}
+          />
+        )}
+      </header>
+      {selected && (
+        <button disabled={busy} onClick={() => setManaging(false)}>
+          Back to {selected.name}
+        </button>
+      )}
+      {error && (
+        <div className="error" role="alert">
+          <p>{error}</p>
+          <button disabled={busy} onClick={() => run(() => initialize())}>
+            Retry loading tables
+          </button>
+        </div>
+      )}
+      {loading ? (
+        <p role="status">Loading your tables…</p>
+      ) : (
+        <Onboarding run={run} busy={busy} onJoined={initialize} />
       )}
     </div>
   );

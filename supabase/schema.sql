@@ -9,8 +9,9 @@ create table public.homegames (
 create table public.homegame_members (
  homegame_id uuid not null references public.homegames(id) on delete cascade,
  user_id uuid not null references auth.users(id) on delete cascade, joined_at timestamptz not null default now(),
- primary key(homegame_id,user_id), unique(user_id)
+ primary key(homegame_id,user_id)
 );
+create index homegame_members_user_id_idx on public.homegame_members(user_id);
 create table private.invites (
  homegame_id uuid primary key references public.homegames(id) on delete cascade,
  code text unique not null default upper(replace(gen_random_uuid()::text,'-',''))

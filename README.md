@@ -2,6 +2,24 @@
 
 A shared tracker for one friend group's poker games. Vite + React + JavaScript, Supabase Auth/PostgreSQL/Realtime, and Vercel static hosting. Every buy-in is $15. There are no player accounts or email/password forms.
 
+## Existing Supabase project: enable multiple homegames
+
+**Keep your existing project and test data. Do not rerun `schema.sql`.**
+
+1. Open [your Supabase dashboard](https://supabase.com/dashboard) and click your **existing Poker Homegame project**.
+2. Click **SQL Editor → New query**.
+3. Open [`supabase/migrations/20260914_multiple_homegames.sql`](supabase/migrations/20260914_multiple_homegames.sql) in this repository. Copy the entire file, paste it into the new query, and click **Run**.
+4. This removes only `homegame_members_user_id_key`, the `UNIQUE(user_id)` constraint, and adds a non-unique index on `user_id`. It does not delete or change any homegame, membership, player, game, result, settlement, or invite. The composite primary key `(homegame_id, user_id)` remains. The migration is safe to rerun.
+5. Locally, restart `npm run dev` if needed, then reload the app. Your current table should still appear. Use **Your tables** in the header to switch groups, **+ Create homegame**, or **+ Join homegame**. Creating/joining selects the new table while keeping previous memberships.
+6. To update the live site, review and commit/push the frontend changes yourself when ready. Vercel will deploy the updated repository through your existing setup. **No Vercel environment variables, Supabase keys, Auth settings, or hosting configuration need to change.** No commit, push, deployment, or live SQL execution is performed by the implementation task.
+7. Create a second table, add a player there, and switch back: the original table must retain its own players/history. Start one game in each table, switch between them, and reload with the second selected. It should reopen that table. You can join a third table with an invite without losing the first two.
+
+Membership listing uses the existing RLS-protected `homegames` SELECT endpoint; it now fetches the full ordered list rather than `.limit(1)`. The anonymous session remains unchanged. `selectedHomegameId` remembers only a browser preference under `poker-selected-homegame-id`. Startup checks that ID against the memberships returned by Supabase, falls back to the oldest accessible homegame (ID breaks ties), or shows onboarding when there are none. It is never used as an authorization boundary.
+
+Each selected table mounts a separate keyed view. Switching resets navigation, selected games, player profiles, chip drafts and invite/copy state; unsubscribes the old Realtime channel; and loads the new table's snapshot. Pending old fetches are invalidated, and late channel callbacks are ignored. Switching is disabled during a save and asks before discarding unsaved game inputs. Backups name the selected table in the UI and JSON; filenames include its UUID to distinguish groups with identical names.
+
+Tests cover fresh and migrated databases, unchanged existing data, repeat migration, A/B creation, C joining, duplicate joins, per-group active games/statistics/backups, and unauthorized identities. Browser fixtures cover switching both ways, selection after reload, invalid stored selection, a delayed previous-table snapshot, and old subscription cleanup. The browser fixture backend is intercepted before navigation, so it never calls the real project even when `.env.local` is configured.
+
 ## First-time setup — do these steps in order
 
 You need a Supabase account and a Vercel account to manage infrastructure. **Your friends do not need either account.** Nothing has been deployed or pushed for you.
@@ -59,7 +77,7 @@ For an additional hosted security check, use an unrelated private-browser identi
 
 `homegames`, `homegame_members`, `players`, `games`, `game_players`, and `settlements` are normalized tables. Private invite codes live in `private.invites`, outside the public API schema. Cents are PostgreSQL integer/bigint values; inputs are bounded so all browser arithmetic stays within safe integer range.
 
-Supabase automatically creates or restores an anonymous session for the browser. This UUID is a **device/app identity**, unrelated to poker players. Each device belongs to one homegame in this version. Multiple devices can join the same homegame. A user never has to identify which poker player they are.
+Supabase automatically creates or restores an anonymous session for the browser. This UUID is a **device/app identity**, unrelated to poker players. Each device can belong to multiple homegames, and multiple devices can join the same homegame. The header switcher chooses which group is displayed. A user never has to identify which poker player they are.
 
 Codes contain 32 hexadecimal characters from a cryptographically generated UUID (122 random bits). `create_homegame` atomically creates the group, invite, and membership. `join_homegame_by_code` validates the code on the database server and inserts membership for `auth.uid()`; it never accepts a caller-supplied member UUID. All members can retrieve/copy their own group's code. All members have equal editing rights, including corrections and confirmed deletion.
 
@@ -107,7 +125,7 @@ npm run preview
 - Financial tests cover zero/positive/negative variance, rounding ties, invalid inputs, winner-only transfers, exact optimization against an independent exhaustive oracle, and copy output.
 - Statistics/backup tests cover completed-only aggregation, chronology, corrections/deletions, and backup scope.
 - Database tests use **PGlite (real PostgreSQL compiled to WASM)** as a test-only dependency. They run the migration and exercise RLS, grants, invite joining, membership spoofing, cross-group reads/writes, atomic rollback, input conflicts, completion, correction and deletion. Supabase's `auth.users` and `auth.uid()` are locally shimmed. These tests do not validate Supabase's hosted JWT/session service or actual Realtime sockets.
-- `tests/browser-smoke.mjs` is an optional Playwright/Chrome test using an intercepted database module and isolated fixture data. It covers the rendered workflow at 375px and 1280px, with screenshots and browser-error/overflow checks. Run `node tests/browser-smoke.mjs` with Vite running and Playwright available, or set `PLAYWRIGHT_MODULE_PATH` to an existing Playwright module path. Playwright is not a production dependency. The test's first assertion expects no local Supabase configuration; run it with the two Vite variables unset. This is UI verification, not a live cloud integration test.
+- `tests/browser-smoke.mjs` is an optional Playwright/Chrome test using an intercepted database module and isolated fixture data. It covers the rendered workflow at 375px and 1280px, with screenshots and browser-error/overflow checks. Run `node tests/browser-smoke.mjs` with Vite running and Playwright available, or set `PLAYWRIGHT_MODULE_PATH` to an existing Playwright module path. Playwright is not a production dependency. The test intercepts the backend module before navigation, including the missing-configuration screen, so configured local credentials are not used. This is UI verification, not a live cloud integration test.
 
 ### File map
 
@@ -116,6 +134,8 @@ npm run preview
 | `src/App.jsx`, `src/App.css`, `src/index.css`                   | Auth startup, navigation, dashboard, new game, settings, responsive design |
 | `src/components/GameView.jsx`, `Results.jsx`, `PlayersView.jsx` | Shared game entry/corrections, results/payments, player profiles/chart     |
 | `src/calculations.js`                                           | Pure integer-cent calculations and exact optimizer                         |
+| `src/lib/homegames.js`                                          | Validated selected-table preference; no poker data stored locally          |
+| `supabase/migrations/20260914_multiple_homegames.sql`           | Data-preserving upgrade for existing projects                              |
 | `src/lib/supabase.js`                                           | Public client, anonymous session, RPC/read adapters, saved-result mapping  |
 | `src/lib/statistics.js`, `backup.js`                            | Derived statistics and versioned exports                                   |
 | `supabase/schema.sql`                                           | Tables, constraints, indexes, RLS, safe RPCs, Realtime publication         |
