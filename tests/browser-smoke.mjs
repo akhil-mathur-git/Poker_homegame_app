@@ -2,6 +2,7 @@
 // PLAYWRIGHT_MODULE_PATH may point at an existing Playwright installation.
 import { readFile, mkdir } from "node:fs/promises";
 import assert from "node:assert/strict";
+import { PGlite } from "@electric-sql/pglite";
 const { chromium } = await import(
   process.env.PLAYWRIGHT_MODULE_PATH || "playwright"
 );
@@ -15,6 +16,50 @@ const page = await context.newPage();
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
 const base = process.env.QA_URL || "http://127.0.0.1:5173";
+const db = new PGlite();
+const ownerId = "10000000-0000-0000-0000-000000000001",
+  otherId = "10000000-0000-0000-0000-000000000002";
+await db.exec(`create role anon;create role authenticated;create schema auth;create table auth.users(id uuid primary key);
+create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;
+grant usage on schema auth to authenticated;grant execute on function auth.uid() to authenticated;create publication supabase_realtime;`);
+await db.query("insert into auth.users values($1),($2)", [ownerId, otherId]);
+await db.exec(
+  await readFile(new URL("../supabase/schema.sql", import.meta.url), "utf8"),
+);
+await db.query("select set_config('request.jwt.claim.sub',$1,false)", [
+  otherId,
+]);
+const groupC = (
+  await db.query("select public.create_homegame('Table C') as id")
+).rows[0].id;
+await db.query(
+  "update private.invites set code='TESTCINVITE' where homegame_id=$1",
+  [groupC],
+);
+await db.query("select set_config('request.jwt.claim.sub',$1,false)", [
+  ownerId,
+]);
+await db.exec("set role authenticated");
+await page.exposeFunction("__dbRpc", async (name, args = {}) => {
+  if (name === "list")
+    return (
+      await db.query(
+        "select id,name,created_at,created_by from public.homegames order by created_at,id",
+      )
+    ).rows;
+  const keys = Object.keys(args);
+  if (!/^[a-z_]+$/.test(name) || keys.some((k) => !/^p_[a-z_]+$/.test(k)))
+    throw new Error("Invalid fixture call");
+  const result = await db.query(
+    `select public.${name}(${keys.map((k, i) => `${k} => $${i + 1}`).join(",")}) as value`,
+    keys.map((k) =>
+      ["p_inputs", "p_payments"].includes(k)
+        ? JSON.stringify(args[k])
+        : args[k],
+    ),
+  );
+  return result.rows[0].value;
+});
 try {
   const actual = await readFile(
     new URL("../src/lib/supabase.js", import.meta.url),
@@ -39,28 +84,12 @@ try {
   await page.unroute("**/src/lib/supabase.js*");
   const mock = `
     export const configurationError='';
-    let store=JSON.parse(localStorage.getItem('poker-ui-fixture')||'{"groups":[],"data":{}}');
-    const empty=()=>({players:[],games:[],game_players:[],settlements:[]});
     window.__channels=[];window.__fetches=[];
     export const supabase={channel:name=>({name,active:false,callbacks:[],on(kind,filter,callback){this.callbacks.push({filter,callback});return this},subscribe(cb){this.active=true;window.__channels.push(this);cb('SUBSCRIBED');return this}}),removeChannel(channel){channel.active=false}};
-    export async function ensureSession(){return {user:{id:'test-device'}}}
-    export async function loadHomegames(){return structuredClone(store.groups)}
-    export async function loadData(id){window.__fetches.push(id);const result=structuredClone(store.data[id]);if(window.__delayGroup===id)await new Promise(resolve=>setTimeout(resolve,700));return result;}
-    export async function rpc(name,p){
-      try { return await mutate(name,p); } finally {localStorage.setItem('poker-ui-fixture',JSON.stringify(store));}
-    }
-    async function mutate(name,p){
-      if(name==='create_homegame'){const id=crypto.randomUUID();store.groups.push({id,name:p.p_name});store.data[id]=empty();return id}
-      if(name==='join_homegame_by_code'){if(p.p_code!=='TEST-C-INVITE')throw new Error('Invalid invite');let c=store.groups.find(g=>g.name==='Table C');if(!c){c={id:crypto.randomUUID(),name:'Table C'};store.groups.push(c);store.data[c.id]=empty();}return c.id}
-      const groupId=p.p_homegame||Object.keys(store.data).find(id=>store.data[id].games.some(g=>g.id===p.p_game));
-      const data=store.data[groupId];
-      if(name==='save_player'){const id=p.p_id||crypto.randomUUID();const existing=data.players.find(x=>x.id===id);if(existing){existing.name=p.p_name;existing.archived=p.p_archived}else data.players.push({id,name:p.p_name,archived:false});return id}
-      if(name==='start_game'){const id=crypto.randomUUID();data.games.push({id,name:p.p_name,game_date:p.p_date,created_at:new Date().toISOString(),status:'active',revision:0});data.game_players=p.p_players.map(player_id=>({game_id:id,player_id,player_name_snapshot:data.players.find(p=>p.id===player_id).name,buy_ins:1,final_chips_cents:0}));return id}
-      if(name==='update_game_input'){const row=data.game_players.find(x=>x.player_id===p.p_player);if(p.p_chips!==undefined)row.final_chips_cents=p.p_chips;if(p.p_delta)row.buy_ins+=p.p_delta;data.games[0].revision++;return}
-      if(name==='complete_game'){const {calculateSettlement}=await import('/src/calculations.js');const s=calculateSettlement(p.p_inputs.map(x=>({id:x.id,name:data.players.find(y=>y.id===x.id).name,buyIns:x.buyIns,finalChips:(x.finalChipsCents/100).toFixed(2)})));data.games[0]={...data.games[0],status:'completed',revision:data.games[0].revision+1,total_collected_cents:s.totals.totalMoneyCollectedCents,total_buy_ins:s.totals.totalBuyIns,total_final_chips_cents:s.totals.totalFinalChipsCents,variance_cents:s.totals.discrepancyCents};data.game_players=s.results.map(x=>({game_id:p.p_game,player_id:x.id,player_name_snapshot:x.name,buy_ins:x.buyIns,final_chips_cents:x.finalChipsCents,amount_paid_cents:x.amountPaidCents,raw_result_cents:x.rawResultCents,variance_adjustment_cents:x.adjustmentCents,final_result_cents:x.adjustedResultCents}));data.settlements=s.payments.map(x=>({game_id:p.p_game,from_player_id:x.fromId,to_player_id:x.toId,from_player_name_snapshot:x.fromName,to_player_name_snapshot:x.toName,amount_cents:x.amountCents}));return}
-      if(name==='get_invite_code')return 'INVITE-'+groupId;
-      throw new Error('Unsupported mock RPC '+name)
-    }
+    export async function ensureSession(){return {user:{id:'${ownerId}'}}}
+    export async function loadHomegames(){return window.__dbRpc('list')}
+    export async function loadData(id){window.__fetches.push(id);const result=await window.__dbRpc('get_homegame_data',{p_homegame:id});if(window.__delayGroup===id)await new Promise(resolve=>setTimeout(resolve,700));return result;}
+    export async function rpc(name,p){return window.__dbRpc(name,p)}
     ${actual.slice(actual.indexOf("export function inputsForGame"))}
   `;
   await page.route("**/src/lib/supabase.js*", (route) =>
@@ -104,9 +133,9 @@ try {
     await page
       .getByLabel(`Final chips for ${name}`, { exact: true })
       .fill(chips[i]);
-    await page.getByRole("button", { name: "Save chips", exact: true }).click();
+    await page.getByRole("button", { name: "Save entry", exact: true }).click();
     await page
-      .getByRole("button", { name: "Save chips", exact: true })
+      .getByRole("button", { name: "Save entry", exact: true })
       .waitFor({ state: "hidden" });
   }
   await page
@@ -186,7 +215,7 @@ try {
   await page
     .getByRole("button", { name: "Show & copy invite code", exact: true })
     .click();
-  await page.getByText("INVITE-" + groupB, { exact: true }).waitFor();
+  const inviteB = await page.locator(".invite-code").innerText();
   const downloadBPromise = page.waitForEvent("download");
   await page
     .getByRole("button", { name: "Export backup", exact: true })
@@ -199,14 +228,12 @@ try {
   await page
     .getByRole("button", { name: "Settings and invite", exact: true })
     .click();
-  assert.equal(
-    await page.getByText("INVITE-" + groupB, { exact: true }).count(),
-    0,
-  );
+  assert.equal(await page.getByText(inviteB, { exact: true }).count(), 0);
   await page
     .getByRole("button", { name: "Show & copy invite code", exact: true })
     .click();
-  await page.getByText("INVITE-" + groupA, { exact: true }).waitFor();
+  const inviteA = await page.locator(".invite-code").innerText();
+  assert.notEqual(inviteA, inviteB);
   const downloadAPromise = page.waitForEvent("download");
   await page
     .getByRole("button", { name: "Export backup", exact: true })
@@ -230,8 +257,44 @@ try {
   for (const name of ["B-only player", "B second player"])
     await page.getByLabel(name, { exact: true }).check();
   await page.getByLabel("Game name", { exact: true }).fill("B active");
+  await page.getByLabel("Flexible amount", { exact: true }).check();
   await page.getByRole("button", { name: "Start game", exact: true }).click();
   await page.getByRole("heading", { name: "B active", exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole("button", { name: /Increase buy-ins/ }).count(),
+    0,
+  );
+  await page
+    .getByRole("button", { name: "Calculate settlement", exact: true })
+    .click();
+  await page
+    .getByRole("alert")
+    .filter({ hasText: "Enter a result for every player" })
+    .waitFor();
+  for (const [name, amount, field, result] of [
+    ["B-only player", "47.50", "Final chips", "70.50"],
+    ["B second player", "30.00", "Net P/L", "-23.00"],
+  ]) {
+    await page
+      .getByLabel(`Amount in for ${name}`, { exact: true })
+      .fill(amount);
+    await page.getByLabel(`${field} for ${name}`, { exact: true }).fill(result);
+    await page.getByRole("button", { name: "Save entry", exact: true }).click();
+    await page
+      .getByRole("button", { name: "Save entry", exact: true })
+      .waitFor({ state: "hidden" });
+  }
+  assert.equal(
+    await page
+      .getByLabel("Final chips for B second player", { exact: true })
+      .inputValue(),
+    "7.00",
+  );
+  await page.screenshot({
+    path: `${output}/flexible-entry-375.png`,
+    fullPage: true,
+  });
+
   await switcher.selectOption(groupA);
   await page.getByRole("heading", { name: "Home", exact: true }).waitFor();
   assert.equal(await page.getByText("B active", { exact: true }).count(), 0);
@@ -247,8 +310,43 @@ try {
   for (const name of ["Ben", "Josh"])
     await page.getByLabel(name, { exact: true }).check();
   await page.getByLabel("Game name", { exact: true }).fill("A active");
+  await page.getByLabel("Buy-in value", { exact: true }).fill("20.00");
   await page.getByRole("button", { name: "Start game", exact: true }).click();
   await page.getByRole("heading", { name: "A active", exact: true }).waitFor();
+  await page.getByLabel("Net P/L for Ben", { exact: true }).fill("+23");
+  assert.equal(
+    await page.getByLabel("Final chips for Ben", { exact: true }).inputValue(),
+    "43.00",
+  );
+  await page.getByRole("button", { name: "Save entry", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Save entry", exact: true })
+    .waitFor({ state: "hidden" });
+  await page
+    .getByRole("button", { name: "Increase buy-ins for Ben", exact: true })
+    .click();
+  await page.waitForFunction(
+    () =>
+      document.querySelector('[aria-label="Final chips for Ben"]').value ===
+      "63.00",
+  );
+  await page.getByLabel("Final chips for Ben", { exact: true }).fill("68.00");
+  await page.getByRole("button", { name: "Save entry", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Save entry", exact: true })
+    .waitFor({ state: "hidden" });
+  await page
+    .getByRole("button", { name: "Increase buy-ins for Ben", exact: true })
+    .click();
+  await page.waitForFunction(
+    () =>
+      document.querySelector('[aria-label="Net P/L for Ben"]').value === "8.00",
+  );
+  await page.screenshot({
+    path: `${output}/fixed-linked-375.png`,
+    fullPage: true,
+  });
+
   // Trigger a delayed A snapshot via Realtime, then switch before it resolves.
   await page.evaluate((id) => {
     window.__delayGroup = id;
@@ -323,11 +421,109 @@ try {
     ),
     false,
   );
+
+  await page
+    .getByRole("button", { name: "Settings and invite", exact: true })
+    .click();
+  assert.equal(
+    await page
+      .getByRole("button", { name: "Delete homegame", exact: true })
+      .count(),
+    0,
+  );
+  await page
+    .getByRole("button", { name: "Leave homegame", exact: true })
+    .click();
+  await page.getByRole("dialog").waitFor();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Leave homegame", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Yes, leave", exact: true }).click();
+  await page.getByRole("heading", { name: "A active", exact: true }).waitFor();
+  await page
+    .getByRole("button", { name: "Settings and invite", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Delete homegame", exact: true })
+    .click();
+  await page.screenshot({
+    path: `${output}/delete-confirmation-375.png`,
+    fullPage: true,
+  });
+  await page
+    .getByRole("button", { name: "Yes, delete permanently", exact: true })
+    .click();
+  await page.getByRole("heading", { name: "B active", exact: true }).waitFor();
+  assert.equal(
+    await page.getByLabel("Selected homegame", { exact: true }).inputValue(),
+    groupB,
+  );
+  await page
+    .getByRole("button", { name: "Continue game →", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Calculate settlement", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Complete & save game", exact: true })
+    .click();
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  await page.getByRole("button", { name: /B active/ }).click();
+  await page.getByRole("button", { name: "Edit game", exact: true }).click();
+  await page
+    .getByLabel("Amount in for B second player", { exact: true })
+    .fill("40.00");
+  assert.equal(
+    await page
+      .getByLabel("Net P/L for B second player", { exact: true })
+      .inputValue(),
+    "-23.00",
+  );
+  assert.equal(
+    await page
+      .getByLabel("Final chips for B second player", { exact: true })
+      .inputValue(),
+    "17.00",
+  );
+  await page
+    .getByRole("button", { name: "Calculate settlement", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Save corrected game", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Settings and invite", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Delete homegame", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Yes, delete permanently", exact: true })
+    .click();
+  await page
+    .getByRole("heading", { name: "Join your table", exact: true })
+    .waitFor();
+  assert.equal(
+    await page.evaluate(() =>
+      localStorage.getItem("poker-selected-homegame-id"),
+    ),
+    null,
+  );
+  assert.equal(
+    await page.evaluate(() => window.__channels.filter((c) => c.active).length),
+    0,
+  );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: setup, onboarding, player creation, new game, entries, settlement, completion, correction, profile, archive; no overflow at 375px; no browser errors. Multi-table isolation, reload preference, invite joining, delayed snapshots and subscription cleanup passed. Database module mocked.",
+    "PASS: setup, onboarding, player creation, new game, entries, settlement, completion, correction, profile, archive; no overflow at 375px; no browser errors. Multi-table isolation, reload preference, invite joining, delayed snapshots and subscription cleanup passed. Database calls exercised in isolated PostgreSQL; Auth and Realtime transport mocked.",
   );
   console.log("Screenshots: " + output);
+} catch (error) {
+  await page.screenshot({ path: `${output}/failure.png`, fullPage: true });
+  console.error(await page.locator("body").innerText());
+  throw error;
 } finally {
   await browser.close();
+  await db.close();
 }

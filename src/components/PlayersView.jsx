@@ -110,7 +110,7 @@ function Profile({ player, data, homegameId, run, busy, refresh, onBack }) {
     ["Games played", stats.games],
     ["Lifetime net", formatMoney(stats.net, { signed: true })],
     ["Average / game", formatMoney(stats.average, { signed: true })],
-    ["Total buy-ins", stats.buyIns],
+    ["Fixed buy-ins", stats.buyIns],
     ["Total bought in", formatMoney(stats.paid)],
     ["Biggest win", formatMoney(stats.biggestWin, { signed: true })],
     ["Biggest loss", formatMoney(stats.biggestLoss, { signed: true })],

@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import {
   calculateSettlement,
+  derivePlayer,
   formatMoney,
+  gameBuyIn,
   parseMoneyToCents,
 } from "../calculations.js";
 import { inputsForGame, rpc, savedSettlement } from "../lib/supabase.js";
@@ -16,12 +18,13 @@ export default function GameView({
   goHome,
   markDirty,
 }) {
-  const [editing, setEditing] = useState(null);
-  const [drafts, setDrafts] = useState({});
-  const [preview, setPreview] = useState(null);
-  const liveInputs = inputsForGame(game, data);
-  const inputs = editing?.inputs || liveInputs;
+  const [editing, setEditing] = useState(null),
+    [drafts, setDrafts] = useState({}),
+    [preview, setPreview] = useState(null);
+  const liveInputs = inputsForGame(game, data),
+    inputs = editing?.inputs ?? liveInputs;
   const dirty = Object.keys(drafts).length > 0;
+  const { mode, value } = gameBuyIn(game);
   useEffect(() => {
     const unsaved = dirty || Boolean(editing);
     markDirty(unsaved);
@@ -40,43 +43,46 @@ export default function GameView({
   const editConflict = editing && editing.revision !== game.revision;
   const validPreview =
     preview && preview.revision === (editing?.revision ?? game.revision);
-  function calculate() {
-    return run(async () => {
-      setPreview({
-        settlement: calculateSettlement(inputs),
-        inputs,
-        revision: editing?.revision ?? game.revision,
-      });
-    });
-  }
-  function editInput(id, field, value) {
-    setEditing((current) => ({
-      ...current,
-      inputs: current.inputs.map((p) =>
-        p.id === id ? { ...p, [field]: value } : p,
-      ),
-    }));
+  function change(p, patch) {
     setPreview(null);
+    if (editing)
+      setEditing((current) => ({
+        ...current,
+        inputs: current.inputs.map((x) =>
+          x.id === p.id ? { ...x, ...patch } : x,
+        ),
+      }));
+    else
+      setDrafts((current) => ({
+        ...current,
+        [p.id]: {
+          ...current[p.id],
+          ...patch,
+          expectedRevision: current[p.id]?.expectedRevision ?? p.inputRevision,
+        },
+      }));
   }
-  async function saveChips(p) {
-    const draft = drafts[p.id];
-    const cents = parseMoneyToCents(draft.value);
-    if (cents === null || cents > 100000000)
-      throw new Error(
-        "Enter a chip amount from $0 to $1,000,000 with at most two decimal places.",
-      );
-    await rpc("update_game_input", {
-      p_game: game.id,
-      p_player: p.id,
-      p_chips: cents,
-      p_expected_chips: draft.expected,
-    });
+  function discard(id) {
     setDrafts((current) => {
       const next = { ...current };
-      delete next[p.id];
+      delete next[id];
       return next;
     });
-    setPreview(null);
+  }
+  async function save(p) {
+    const draft = drafts[p.id],
+      entry = { ...p, ...draft };
+    const derived = derivePlayer(entry, game);
+    await rpc("save_game_entry", {
+      p_game: game.id,
+      p_player: p.id,
+      p_revision: draft.expectedRevision,
+      p_amount: draft.amountDirty ? parseMoneyToCents(entry.amountIn) : null,
+      p_save_result: !!draft.resultDirty,
+      p_result_mode: draft.resultDirty ? entry.resultEntryMode : null,
+      p_result_cents: draft.resultDirty ? derived.resultEntryCents : null,
+    });
+    discard(p.id);
     await refresh();
   }
   async function complete() {
@@ -88,7 +94,9 @@ export default function GameView({
       p_inputs: preview.settlement.results.map((p) => ({
         id: p.id,
         buyIns: p.buyIns,
-        finalChipsCents: p.finalChipsCents,
+        amountInCents: p.amountInCents,
+        resultEntryMode: p.resultEntryMode,
+        resultEntryCents: p.resultEntryCents,
       })),
       p_payments: preview.settlement.payments,
     });
@@ -96,7 +104,6 @@ export default function GameView({
     markDirty(false);
     goHome();
   }
-  const isEntry = game.status === "active" || editing;
   return (
     <>
       <div className="section-head">
@@ -110,7 +117,10 @@ export default function GameView({
           </p>
           <h1>{game.name}</h1>
           <p className="muted">
-            {game.game_date} · {inputs.length} players · $15 buy-in
+            {game.game_date} · {inputs.length} players ·{" "}
+            {mode === "fixed"
+              ? `${formatMoney(value)} fixed buy-ins`
+              : "Flexible amount"}
           </p>
         </div>
         <button onClick={goHome}>Back</button>
@@ -134,32 +144,49 @@ export default function GameView({
             />
           </label>
           <p className="muted">
-            Your correction stays on this device until you save. If another
-            member changes the game, saving will be rejected.
+            This game keeps its original buy-in tracking. Corrections are saved
+            only when you recalculate and save.
           </p>
         </div>
       )}
       {editConflict && (
         <p className="notice" role="alert">
           This game changed on another device. Note your corrections, cancel
-          this edit, then reopen it to use the latest saved version.
+          this edit, then reopen it.
         </p>
       )}
-      {isEntry ? (
+      {game.status === "active" || editing ? (
         <>
-          <Totals inputs={inputs} />
+          <Totals
+            inputs={inputs.map((p) => ({ ...p, ...drafts[p.id] }))}
+            game={game}
+          />
           {dirty && (
             <p className="notice">
-              Chip inputs marked “Unsaved” have not been saved to the shared
-              game. Save each before calculating.
+              Entries marked “Unsaved” are still on this device. Save each
+              before calculating.
             </p>
           )}
           <div className="cards">
             {inputs.map((p) => {
-              const value = editing
-                ? p.finalChips
-                : (drafts[p.id]?.value ?? p.finalChips);
-              const chips = parseMoneyToCents(value);
+              const entry = { ...p, ...drafts[p.id] };
+              let derived = null,
+                validation = "";
+              try {
+                derived = derivePlayer(entry, game);
+              } catch (e) {
+                validation = e.message;
+              }
+              const resultValue = (field) =>
+                entry.resultEntryMode === field
+                  ? entry.resultEntry
+                  : derived?.finalChipsCents == null
+                    ? ""
+                    : (
+                        (field === "final_chips"
+                          ? derived.finalChipsCents
+                          : derived.rawResultCents) / 100
+                      ).toFixed(2);
               return (
                 <article className="card" key={p.id}>
                   <div className="section-head">
@@ -180,102 +207,138 @@ export default function GameView({
                       </button>
                     )}
                   </div>
-                  <div className="entry-controls">
-                    <div>
-                      <span className="field-label">Buy-ins</span>
-                      <div className="stepper">
-                        <button
-                          aria-label={`Decrease buy-ins for ${p.name}`}
-                          disabled={busy || p.buyIns === 0}
-                          onClick={() =>
-                            editing
-                              ? editInput(p.id, "buyIns", p.buyIns - 1)
-                              : run(async () => {
-                                  await rpc("update_game_input", {
-                                    p_game: game.id,
-                                    p_player: p.id,
-                                    p_delta: -1,
-                                  });
-                                  await refresh();
-                                })
-                          }
-                        >
-                          −
-                        </button>
-                        <strong>{p.buyIns}</strong>
-                        <button
-                          aria-label={`Increase buy-ins for ${p.name}`}
-                          disabled={busy || p.buyIns >= 10000}
-                          onClick={() =>
-                            editing
-                              ? editInput(p.id, "buyIns", p.buyIns + 1)
-                              : run(async () => {
-                                  await rpc("update_game_input", {
-                                    p_game: game.id,
-                                    p_player: p.id,
-                                    p_delta: 1,
-                                  });
-                                  await refresh();
-                                })
-                          }
-                        >
-                          +
-                        </button>
-                      </div>
-                    </div>
-                    <label>
-                      Final chips ($)
-                      <input
-                        inputMode="decimal"
-                        aria-label={`Final chips for ${p.name}`}
-                        value={value}
-                        disabled={busy}
-                        onChange={(e) => {
-                          if (!/^\d*(?:\.\d{0,2})?$/.test(e.target.value))
-                            return;
-                          if (editing)
-                            editInput(p.id, "finalChips", e.target.value);
-                          else
-                            setDrafts((current) => ({
-                              ...current,
-                              [p.id]: {
-                                value: e.target.value,
-                                expected:
-                                  current[p.id]?.expected ??
-                                  parseMoneyToCents(p.finalChips),
-                              },
-                            }));
-                        }}
-                      />
-                    </label>
+                  <div className="entry-controls amount-controls">
+                    {mode === "fixed" ? (
+                      <>
+                        <div>
+                          <span className="field-label">Buy-ins</span>
+                          <div className="stepper">
+                            {[-1, 1].map((delta) => (
+                              <button
+                                key={delta}
+                                aria-label={`${delta < 0 ? "Decrease" : "Increase"} buy-ins for ${p.name}`}
+                                disabled={
+                                  busy ||
+                                  (!editing && !!drafts[p.id]) ||
+                                  (delta < 0
+                                    ? p.buyIns === 0
+                                    : p.buyIns >= 10000)
+                                }
+                                onClick={() =>
+                                  editing
+                                    ? change(p, { buyIns: p.buyIns + delta })
+                                    : run(async () => {
+                                        await rpc("update_game_input", {
+                                          p_game: game.id,
+                                          p_player: p.id,
+                                          p_delta: delta,
+                                        });
+                                        await refresh();
+                                      })
+                                }
+                              >
+                                {delta < 0 ? "−" : "+"}
+                              </button>
+                            ))}
+                            <strong>{p.buyIns}</strong>
+                          </div>
+                        </div>
+                        <div>
+                          <span className="field-label">Amount in</span>
+                          <strong className="amount-in">
+                            {formatMoney(p.buyIns * value)}
+                          </strong>
+                        </div>
+                      </>
+                    ) : (
+                      <label>
+                        Amount in ($)
+                        <input
+                          aria-label={`Amount in for ${p.name}`}
+                          inputMode="decimal"
+                          value={entry.amountIn}
+                          disabled={busy}
+                          onChange={(e) => {
+                            if (/^\d*(?:\.\d{0,2})?$/.test(e.target.value))
+                              change(p, {
+                                amountIn: e.target.value,
+                                amountDirty: true,
+                              });
+                          }}
+                        />
+                      </label>
+                    )}
                   </div>
+                  <div className="entry-controls linked-results">
+                    {[
+                      ["final_chips", "Final chips"],
+                      ["net_pl", "Net P/L"],
+                    ].map(([field, label]) => (
+                      <label
+                        key={field}
+                        className={
+                          entry.resultEntryMode === field
+                            ? "source-field"
+                            : "companion-field"
+                        }
+                      >
+                        {label} ($)
+                        <input
+                          aria-label={`${label} for ${p.name}`}
+                          inputMode={field === "net_pl" ? "text" : "decimal"}
+                          value={resultValue(field)}
+                          disabled={busy}
+                          onChange={(e) => {
+                            if (/^[+-]?\d*(?:\.\d{0,2})?$/.test(e.target.value))
+                              change(p, {
+                                resultEntryMode: field,
+                                resultEntry: e.target.value,
+                                resultDirty: true,
+                              });
+                          }}
+                        />
+                        <small>
+                          {entry.resultEntryMode === field
+                            ? "Entered source"
+                            : "Calculated · editable"}
+                        </small>
+                      </label>
+                    ))}
+                  </div>
+                  {validation && (
+                    <p className="negative input-error" role="status">
+                      {validation}
+                    </p>
+                  )}
+                  {!validation && derived?.resultEntryCents === null && (
+                    <p className="muted input-error">Result not entered</p>
+                  )}
                   {!editing && drafts[p.id] && (
                     <div className="actions">
                       <span className="muted">Unsaved</span>
                       <button
-                        disabled={busy}
-                        onClick={() => run(() => saveChips(p))}
+                        disabled={busy || !!validation}
+                        onClick={() => run(() => save(p))}
                       >
-                        Save chips
+                        Save entry
                       </button>
-                      <button
-                        disabled={busy}
-                        onClick={() =>
-                          setDrafts((current) => {
-                            const next = { ...current };
-                            delete next[p.id];
-                            return next;
-                          })
-                        }
-                      >
+                      <button disabled={busy} onClick={() => discard(p.id)}>
                         Discard
                       </button>
                     </div>
                   )}
                   <div className="row-summary">
-                    <span>Paid {formatMoney(p.buyIns * 1500)}</span>
                     <span>
-                      Raw <Amount cents={(chips ?? 0) - p.buyIns * 1500} />
+                      Amount in{" "}
+                      {derived ? formatMoney(derived.amountPaidCents) : "—"}
+                    </span>
+                    <span>
+                      Raw{" "}
+                      {derived?.rawResultCents == null ? (
+                        "—"
+                      ) : (
+                        <Amount cents={derived.rawResultCents} />
+                      )}
                     </span>
                   </div>
                 </article>
@@ -287,15 +350,21 @@ export default function GameView({
               Add participant
               <select
                 value=""
-                disabled={busy}
                 onChange={(e) => {
-                  const p = data.players.find((p) => p.id === e.target.value);
+                  const p = data.players.find((x) => x.id === e.target.value);
                   if (p) {
                     setEditing({
                       ...editing,
                       inputs: [
                         ...inputs,
-                        { id: p.id, name: p.name, buyIns: 1, finalChips: "" },
+                        {
+                          id: p.id,
+                          name: p.name,
+                          buyIns: mode === "fixed" ? 1 : null,
+                          amountIn: "0.00",
+                          resultEntryMode: "final_chips",
+                          resultEntry: "",
+                        },
                       ],
                     });
                     setPreview(null);
@@ -319,7 +388,14 @@ export default function GameView({
             <button
               className="primary grow"
               disabled={busy || dirty}
-              onClick={calculate}
+              onClick={() =>
+                run(async () =>
+                  setPreview({
+                    settlement: calculateSettlement(inputs, game),
+                    revision: editing?.revision ?? game.revision,
+                  }),
+                )
+              }
             >
               Calculate settlement
             </button>
@@ -362,7 +438,6 @@ export default function GameView({
         <>
           <Results settlement={savedSettlement(game, data)} name={game.name} />
           <button
-            disabled={busy}
             onClick={() => {
               setEditing({
                 name: game.name,

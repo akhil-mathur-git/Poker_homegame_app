@@ -522,3 +522,59 @@ figcaption {
     max-width: none;
   }
 }
+
+.amount-controls {
+  margin-bottom: 14px;
+}
+.amount-in {
+  display: block;
+  padding: 12px 0;
+  font-variant-numeric: tabular-nums;
+}
+.stepper button:first-child {
+  order: 0;
+}
+.stepper strong {
+  order: 1;
+}
+.stepper button:nth-child(2) {
+  order: 2;
+}
+.source-field input {
+  border-color: var(--accent);
+}
+.companion-field input {
+  color: var(--muted);
+}
+.linked-results small {
+  font-size: 0.65rem;
+}
+.input-error {
+  margin: 10px 0 0;
+  font-size: 0.76rem;
+}
+.buy-in-options {
+  margin-bottom: 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+}
+.buy-in-options input[type="radio"] {
+  width: 20px;
+  min-height: 20px;
+  accent-color: var(--accent);
+}
+dialog {
+  width: min(440px, calc(100% - 32px));
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #1b1c20;
+  color: var(--text);
+  padding: 22px;
+}
+dialog::backdrop {
+  background: #000a;
+}
+dialog h2 {
+  margin-top: 0;
+}

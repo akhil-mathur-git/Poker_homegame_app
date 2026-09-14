@@ -15,7 +15,8 @@ import {
   rememberHomegame,
 } from "./lib/homegames.js";
 import { leaderboard } from "./lib/statistics.js";
-import { formatMoney } from "./calculations.js";
+import HomegameDangerZone from "./components/HomegameDangerZone.jsx";
+import { formatMoney, parseMoneyToCents, gameBuyIn } from "./calculations.js";
 import GameView from "./components/GameView.jsx";
 import PlayersView, { AddPlayer } from "./components/PlayersView.jsx";
 import { Amount } from "./components/Results.jsx";
@@ -163,7 +164,9 @@ function GameList({ games, data, onOpen }) {
 function NewGame({ homegame, data, run, busy, refresh, onOpen }) {
   const [name, setName] = useState("Sunday Poker"),
     [date, setDate] = useState(today),
-    [selected, setSelected] = useState([]);
+    [selected, setSelected] = useState([]),
+    [buyInMode, setBuyInMode] = useState("fixed"),
+    [buyInValue, setBuyInValue] = useState("15.00");
   return (
     <>
       <h1>New game</h1>
@@ -171,11 +174,19 @@ function NewGame({ homegame, data, run, busy, refresh, onOpen }) {
         onSubmit={(e) => {
           e.preventDefault();
           run(async () => {
+            const cents = parseMoneyToCents(buyInValue);
+            if (buyInMode === "fixed")
+              gameBuyIn({
+                buy_in_mode: buyInMode,
+                buy_in_value_cents: cents === null ? 0 : cents,
+              });
             const id = await rpc("start_game", {
               p_homegame: homegame.id,
               p_name: name,
               p_date: date,
               p_players: selected,
+              p_buy_in_mode: buyInMode,
+              p_buy_in_value_cents: buyInMode === "fixed" ? cents : null,
             });
             await refresh();
             onOpen(id);
@@ -202,6 +213,42 @@ function NewGame({ homegame, data, run, busy, refresh, onOpen }) {
             />
           </label>
         </div>
+        <fieldset className="buy-in-options">
+          <legend>Buy-in tracking</legend>
+          <label className="check">
+            <input
+              type="radio"
+              name="buy-in-mode"
+              checked={buyInMode === "fixed"}
+              onChange={() => setBuyInMode("fixed")}
+            />
+            Fixed buy-ins
+          </label>
+          <label className="check">
+            <input
+              type="radio"
+              name="buy-in-mode"
+              checked={buyInMode === "flexible"}
+              onChange={() => setBuyInMode("flexible")}
+            />
+            Flexible amount
+          </label>
+          {buyInMode === "fixed" && (
+            <label>
+              Buy-in value ($)
+              <input
+                aria-label="Buy-in value"
+                inputMode="decimal"
+                required
+                value={buyInValue}
+                onChange={(e) => setBuyInValue(e.target.value)}
+              />
+            </label>
+          )}
+          <p className="muted">
+            Tracking stays fixed for this game once started.
+          </p>
+        </fieldset>
         <h2>Who’s playing?</h2>
         <div className="list">
           {data.players
@@ -224,7 +271,10 @@ function NewGame({ homegame, data, run, busy, refresh, onOpen }) {
             ))}
         </div>
         <p className="muted">
-          {selected.length} selected · Each starts with one $15 buy-in.
+          {selected.length} selected ·{" "}
+          {buyInMode === "fixed"
+            ? "Each starts with one buy-in."
+            : "Enter each player’s amount in during the game."}
         </p>
         <button
           className="primary full"
@@ -243,7 +293,7 @@ function NewGame({ homegame, data, run, busy, refresh, onOpen }) {
     </>
   );
 }
-function Settings({ homegame, run, busy }) {
+function Settings({ homegame, run, busy, userId, onMembershipChanged }) {
   const [code, setCode] = useState(""),
     [message, setMessage] = useState("");
   const legacy = readLegacy();
@@ -304,6 +354,13 @@ function Settings({ homegame, run, busy }) {
           Export backup
         </button>
       </section>
+      <HomegameDangerZone
+        homegame={homegame}
+        userId={userId}
+        run={run}
+        busy={busy}
+        onMembershipChanged={onMembershipChanged}
+      />
       {legacy && (
         <section className="card">
           <h2>Previous device-local game</h2>
@@ -327,7 +384,13 @@ function Settings({ homegame, run, busy }) {
     </>
   );
 }
-function HomegameApp({ homegame, homegames, onSelect }) {
+function HomegameApp({
+  homegame,
+  homegames,
+  onSelect,
+  userId,
+  onMembershipChanged,
+}) {
   const [data, setData] = useState(emptyData),
     [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false),
@@ -345,12 +408,21 @@ function HomegameApp({ homegame, homegames, onSelect }) {
   const refresh = useCallback(async () => {
     if (!homegame) return;
     const sequence = ++request.current;
-    const next = await loadData(homegame.id);
+    let next;
+    try {
+      next = await loadData(homegame.id);
+    } catch (error) {
+      if (error.message === "Not a member" && sequence === request.current) {
+        await onMembershipChanged(homegame.id);
+        return;
+      }
+      throw error;
+    }
     if (sequence === request.current) {
       setData(next);
       setLoading(false);
     }
-  }, [homegame]);
+  }, [homegame, onMembershipChanged]);
   const run = useCallback(async (fn) => {
     if (operation.current) return;
     operation.current = true;
@@ -570,7 +642,7 @@ function HomegameApp({ homegame, homegames, onSelect }) {
                       {formatMoney(
                         data.game_players
                           .filter((p) => p.game_id === current.id)
-                          .reduce((s, p) => s + p.buy_ins * 1500, 0),
+                          .reduce((s, p) => s + p.amount_in_cents, 0),
                       )}{" "}
                       collected
                     </p>
@@ -672,7 +744,13 @@ function HomegameApp({ homegame, homegames, onSelect }) {
               />
             )}
             {view === "settings" && (
-              <Settings homegame={homegame} run={run} busy={busy} />
+              <Settings
+                homegame={homegame}
+                run={run}
+                busy={busy}
+                userId={userId}
+                onMembershipChanged={onMembershipChanged}
+              />
             )}
           </>
         )}
@@ -726,6 +804,7 @@ function TableSwitcher({ homegames, selectedId, disabled, onSelect }) {
 
 export default function App() {
   const [homegames, setHomegames] = useState([]);
+  const [userId, setUserId] = useState(null);
   const [selectedHomegameId, setSelectedHomegameId] = useState(null);
   const [managing, setManaging] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -745,7 +824,8 @@ export default function App() {
     window.scrollTo(0, 0);
   };
   const initialize = async (preferredId) => {
-    await ensureSession();
+    const session = await ensureSession();
+    setUserId(session.user.id);
     const groups = await loadHomegames();
     const id = chooseHomegameId(groups, preferredId ?? readSelectedHomegame());
     setHomegames(groups);
@@ -772,7 +852,10 @@ export default function App() {
     if (!supabase) return;
     let alive = true;
     ensureSession()
-      .then(loadHomegames)
+      .then((session) => {
+        if (alive) setUserId(session.user.id);
+        return loadHomegames();
+      })
       .then((groups) => {
         if (!alive) return;
         const id = chooseHomegameId(groups, readSelectedHomegame());
@@ -791,6 +874,25 @@ export default function App() {
       alive = false;
     };
   }, []);
+  const onMembershipChanged = useCallback(async (removedId) => {
+    // Clear access immediately, even if the subsequent membership refresh fails.
+    setHomegames((groups) => groups.filter((g) => g.id !== removedId));
+    setSelectedHomegameId(null);
+    rememberHomegame(null);
+    setLoading(true);
+    try {
+      const groups = await loadHomegames();
+      const id = chooseHomegameId(groups, null);
+      setHomegames(groups);
+      setSelectedHomegameId(id);
+      rememberHomegame(id);
+      setManaging(false);
+    } catch (e) {
+      setError(friendly(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
   if (!supabase) return <Setup />;
   const selected = homegames.find((group) => group.id === selectedHomegameId);
   // A new key gives each table its own lifecycle: no drafts, invite state, fetch
@@ -802,6 +904,8 @@ export default function App() {
         homegame={selected}
         homegames={homegames}
         onSelect={select}
+        userId={userId}
+        onMembershipChanged={onMembershipChanged}
       />
     );
   return (
@@ -814,7 +918,7 @@ export default function App() {
           <TableSwitcher
             homegames={homegames}
             selectedId={null}
-            disabled={busy}
+            disabled={busy || loading}
             onSelect={select}
           />
         )}

@@ -2,7 +2,7 @@ export function buildBackup(homegame, data) {
   const games = data.games.filter((g) => g.status === "completed");
   const ids = new Set(games.map((g) => g.id));
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     exportedAt: new Date().toISOString(),
     homegame: { id: homegame.id, name: homegame.name },
     players: data.players,

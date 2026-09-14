@@ -2,7 +2,8 @@ import { useState } from "react";
 import {
   buildSettlementText,
   formatMoney,
-  parseMoneyToCents,
+  derivePlayer,
+  gameBuyIn,
 } from "../calculations.js";
 
 export function Amount({ cents, signed = true }) {
@@ -14,29 +15,46 @@ export function Amount({ cents, signed = true }) {
     </span>
   );
 }
-export function Totals({ inputs }) {
-  const buyIns = inputs.reduce((s, p) => s + p.buyIns, 0);
-  const chips = inputs.reduce(
-    (s, p) => s + (parseMoneyToCents(p.finalChips) ?? 0),
-    0,
-  );
+export function Totals({ inputs, game }) {
+  let amount = 0,
+    chips = 0,
+    entered = 0;
+  for (const p of inputs) {
+    try {
+      const d = derivePlayer(p, game);
+      amount += d.amountPaidCents;
+      if (d.finalChipsCents !== null) {
+        chips += d.finalChipsCents;
+        entered++;
+      }
+    } catch {
+      /* Drafts can temporarily contain incomplete money. */
+    }
+  }
+  const ready = entered === inputs.length;
   return (
     <div className="totals">
       <div>
-        <span>Buy-ins</span>
-        <strong>{buyIns}</strong>
+        <span>{gameBuyIn(game).mode === "fixed" ? "Buy-ins" : "Players"}</span>
+        <strong>
+          {gameBuyIn(game).mode === "fixed"
+            ? inputs.reduce((s, p) => s + p.buyIns, 0)
+            : inputs.length}
+        </strong>
       </div>
       <div>
         <span>Collected</span>
-        <strong>{formatMoney(buyIns * 1500)}</strong>
+        <strong>{formatMoney(amount)}</strong>
       </div>
       <div>
         <span>Final chips</span>
-        <strong>{formatMoney(chips)}</strong>
+        <strong>
+          {ready ? formatMoney(chips) : `${entered}/${inputs.length} entered`}
+        </strong>
       </div>
       <div>
         <span>Variance</span>
-        <Amount cents={chips - buyIns * 1500} />
+        {ready ? <Amount cents={chips - amount} /> : <strong>—</strong>}
       </div>
     </div>
   );
@@ -76,6 +94,12 @@ export default function Results({ settlement, name }) {
           <article className="card" key={p.id}>
             <h3>{p.name}</h3>
             <dl>
+              {p.buyIns !== null && (
+                <div>
+                  <dt>Buy-ins</dt>
+                  <dd>{p.buyIns}</dd>
+                </div>
+              )}
               <div>
                 <dt>Paid in</dt>
                 <dd>{formatMoney(p.amountPaidCents)}</dd>

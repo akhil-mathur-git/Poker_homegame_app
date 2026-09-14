@@ -15,37 +15,90 @@ export function formatMoney(cents, { signed = false } = {}) {
   return `${sign}$${(Math.abs(cents) / 100).toFixed(2)}`;
 }
 
-export function validatePlayers(players) {
-  if (players.length < 2 || players.length > 22) {
+export const MAX_MONEY_CENTS = 100000000;
+export function parseSignedMoneyToCents(value) {
+  const text = String(value ?? "").trim();
+  if (!/^[+-]?\d+(?:\.\d{0,2})?$/.test(text)) return null;
+  const cents = parseMoneyToCents(text.replace(/^[+-]/, ""));
+  return cents === null ? null : text.startsWith("-") ? -cents : cents;
+}
+export function gameBuyIn(game = {}) {
+  const mode = game.buy_in_mode ?? "fixed";
+  const value =
+    mode === "fixed" ? (game.buy_in_value_cents ?? BUY_IN_CENTS) : null;
+  if (
+    !["fixed", "flexible"].includes(mode) ||
+    (mode === "fixed" &&
+      (!Number.isSafeInteger(value) || value <= 0 || value > MAX_MONEY_CENTS))
+  )
+    throw new Error("Enter a valid positive fixed buy-in value.");
+  return { mode, value };
+}
+// One entered result, plus amount in, determines both outputs. Null means unentered.
+export function derivePlayer(player, game = {}) {
+  const { mode, value } = gameBuyIn(game);
+  const amount =
+    mode === "fixed"
+      ? player.buyIns * value
+      : parseMoneyToCents(player.amountIn);
+  if (
+    mode === "fixed" &&
+    (!Number.isInteger(player.buyIns) ||
+      player.buyIns < 0 ||
+      player.buyIns > 10000)
+  )
+    throw new Error("Buy-ins must be a non-negative whole number.");
+  if (
+    amount === null ||
+    !Number.isSafeInteger(amount) ||
+    amount < 0 ||
+    amount > MAX_MONEY_CENTS ||
+    (mode === "flexible" && String(player.amountIn ?? "").trim() === "")
+  )
+    throw new Error("Enter a valid non-negative amount in (up to $1,000,000).");
+  const source = player.resultEntryMode ?? "final_chips";
+  const text = String(player.resultEntry ?? player.finalChips ?? "").trim();
+  if (!["final_chips", "net_pl"].includes(source))
+    throw new Error("Invalid result source.");
+  const entered = text === "" ? null : parseSignedMoneyToCents(text);
+  if (text !== "" && (entered === null || Math.abs(entered) > MAX_MONEY_CENTS))
+    throw new Error("Enter a valid result with at most two decimal places.");
+  const final =
+    entered === null ? null : source === "net_pl" ? amount + entered : entered;
+  if (final !== null && (final < 0 || final > MAX_MONEY_CENTS))
+    throw new Error(
+      "The result must produce final chips between $0 and $1,000,000.",
+    );
+  return {
+    amountPaidCents: amount,
+    amountInCents: amount,
+    finalChipsCents: final,
+    rawResultCents: final === null ? null : final - amount,
+    resultEntryMode: source,
+    resultEntryCents: entered,
+    buyIns: mode === "fixed" ? player.buyIns : null,
+  };
+}
+export function validatePlayers(players, game = {}) {
+  if (players.length < 2 || players.length > 22)
     return "Choose between 2 and 22 players before calculating a settlement.";
-  }
-
-  const ids = new Set(players.map((player) => player.id));
-  if (ids.size !== players.length || players.some((player) => !player.id))
+  if (
+    new Set(players.map((p) => p.id)).size !== players.length ||
+    players.some((p) => !p.id)
+  )
     return "Every player needs a unique ID.";
-  const normalizedNames = new Set();
+  const names = new Set();
   for (const player of players) {
     const name = player.name.trim();
     if (!name) return "Every player needs a name.";
-
-    const normalizedName = name.toLocaleLowerCase();
-    if (normalizedNames.has(normalizedName)) {
+    if (names.has(name.toLocaleLowerCase()))
       return "Player names must be unique so the settlement is unambiguous.";
-    }
-    normalizedNames.add(normalizedName);
-
-    if (
-      !Number.isInteger(player.buyIns) ||
-      player.buyIns < 0 ||
-      player.buyIns > 10000
-    ) {
-      return `${name}'s buy-ins must be a non-negative whole number.`;
-    }
-    if (
-      parseMoneyToCents(player.finalChips) === null ||
-      parseMoneyToCents(player.finalChips) > 100000000
-    ) {
-      return `${name}'s final chips must be a non-negative dollar amount with no more than two decimal places.`;
+    names.add(name.toLocaleLowerCase());
+    try {
+      if (derivePlayer(player, game).resultEntryCents === null)
+        return "Enter a result for every player before calculating settlement.";
+    } catch (error) {
+      return `${name}: ${error.message}`;
     }
   }
   return null;
@@ -213,29 +266,22 @@ export function findMinimumPayments(results) {
   return payments;
 }
 
-export function calculateSettlement(players) {
-  const validationError = validatePlayers(players);
+export function calculateSettlement(players, game = {}) {
+  const validationError = validatePlayers(players, game);
   if (validationError) throw new Error(validationError);
 
   const results = [...players]
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .map((player) => {
-      const finalChipsCents = parseMoneyToCents(player.finalChips);
-      const amountPaidCents = player.buyIns * BUY_IN_CENTS;
-      return {
-        id: player.id,
-        name: player.name.trim(),
-        buyIns: player.buyIns,
-        finalChipsCents,
-        amountPaidCents,
-        rawResultCents: finalChipsCents - amountPaidCents,
-      };
-    });
+    .map((player) => ({
+      id: player.id,
+      name: player.name.trim(),
+      ...derivePlayer(player, game),
+    }));
 
-  const totalBuyIns = results.reduce(
-    (total, result) => total + result.buyIns,
-    0,
-  );
+  const totalBuyIns =
+    gameBuyIn(game).mode === "flexible"
+      ? null
+      : results.reduce((total, result) => total + result.buyIns, 0);
   const totalMoneyCollectedCents = results.reduce(
     (total, result) => total + result.amountPaidCents,
     0,

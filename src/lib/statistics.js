@@ -27,7 +27,7 @@ export function playerStatistics(playerId, data) {
     games: entries.length,
     net: cumulative,
     average: entries.length ? Math.round(cumulative / entries.length) : 0,
-    buyIns: entries.reduce((s, p) => s + p.buy_ins, 0),
+    buyIns: entries.reduce((s, p) => s + (p.buy_ins ?? 0), 0),
     paid: entries.reduce((s, p) => s + p.amount_paid_cents, 0),
     biggestWin: Math.max(0, ...results),
     biggestLoss: Math.min(0, ...results),

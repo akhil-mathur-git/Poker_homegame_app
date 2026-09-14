@@ -47,7 +47,7 @@ export async function rpc(name, args) {
 export async function loadHomegames() {
   const { data, error } = await supabase
     .from("homegames")
-    .select("id,name,created_at")
+    .select("id,name,created_at,created_by")
     .order("created_at")
     .order("id");
   if (error) throw error;
@@ -65,7 +65,13 @@ export function inputsForGame(game, data) {
       id: p.player_id,
       name: p.player_name_snapshot,
       buyIns: p.buy_ins,
-      finalChips: (p.final_chips_cents / 100).toFixed(2),
+      amountIn: (p.amount_in_cents / 100).toFixed(2),
+      resultEntryMode: p.result_entry_mode,
+      resultEntry:
+        p.result_entry_cents === null
+          ? ""
+          : (p.result_entry_cents / 100).toFixed(2),
+      inputRevision: p.input_revision,
     }));
 }
 export function savedSettlement(game, data) {

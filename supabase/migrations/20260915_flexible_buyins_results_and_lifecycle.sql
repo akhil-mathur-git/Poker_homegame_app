@@ -1,125 +1,28 @@
--- Run once in a new Supabase project's SQL Editor. All money is integer cents.
+-- Existing projects: run this migration once (safe to rerun), not schema.sql.
+-- Existing final chip values, including zeros, remain entered: V2 could not distinguish blanks.
 begin;
-create schema if not exists private;
-revoke all on schema private from public;
-create table public.homegames (
- id uuid primary key default gen_random_uuid(), name text not null check(length(name) between 1 and 80),
- created_by uuid not null references auth.users(id), created_at timestamptz not null default now(), revision integer not null default 0
-);
-create table public.homegame_members (
- homegame_id uuid not null references public.homegames(id) on delete cascade,
- user_id uuid not null references auth.users(id) on delete cascade, joined_at timestamptz not null default now(),
- primary key(homegame_id,user_id)
-);
-create index homegame_members_user_id_idx on public.homegame_members(user_id);
-create table private.invites (
- homegame_id uuid primary key references public.homegames(id) on delete cascade,
- code text unique not null default upper(replace(gen_random_uuid()::text,'-',''))
-);
-create table public.players (
- id uuid primary key default gen_random_uuid(), homegame_id uuid not null references public.homegames(id) on delete cascade,
- name text not null check(length(name) between 1 and 40),
- normalized_name text generated always as (lower(regexp_replace(btrim(name),'\s+',' ','g'))) stored,
- archived boolean not null default false, created_at timestamptz not null default now(),
- unique(homegame_id,normalized_name), unique(id,homegame_id)
-);
-create table public.games (
- id uuid primary key default gen_random_uuid(), homegame_id uuid not null references public.homegames(id) on delete cascade,
- name text not null check(length(name) between 1 and 80), game_date date not null,
- status text not null default 'active' check(status in ('active','completed')),
- revision integer not null default 0,
- buy_in_mode text not null default 'fixed', buy_in_value_cents bigint default 1500,
- constraint game_buy_in_mode check((buy_in_mode='fixed' and buy_in_value_cents is not null and buy_in_value_cents between 1 and 100000000) or (buy_in_mode='flexible' and buy_in_value_cents is null)),
- total_buy_ins integer, total_collected_cents bigint,
- total_final_chips_cents bigint, variance_cents bigint, calculation_version text,
- created_by uuid not null references auth.users(id), created_at timestamptz not null default now(), completed_at timestamptz,
- unique(id,homegame_id)
-);
-create unique index one_active_game on public.games(homegame_id) where status='active';
-create index games_history on public.games(homegame_id,game_date desc);
-create table public.game_players (
- id uuid primary key default gen_random_uuid(), homegame_id uuid not null, game_id uuid not null,
- player_id uuid not null, player_name_snapshot text not null,
- buy_ins integer default 1 check(buy_ins between 0 and 10000),
- final_chips_cents bigint check(final_chips_cents between 0 and 100000000),
- amount_in_cents bigint not null default 0,
- result_entry_mode text not null default 'final_chips', result_entry_cents bigint, input_revision integer not null default 0,
- constraint player_entry_valid check(amount_in_cents between 0 and 100000000 and result_entry_mode in ('final_chips','net_pl') and (result_entry_cents is null or result_entry_cents between -100000000 and 100000000)),
- amount_paid_cents bigint, raw_result_cents bigint, variance_adjustment_cents bigint, final_result_cents bigint,
- foreign key(game_id,homegame_id) references public.games(id,homegame_id) on delete cascade,
- foreign key(player_id,homegame_id) references public.players(id,homegame_id), unique(game_id,player_id)
-);
-create index game_players_group on public.game_players(homegame_id);
-create index game_players_player on public.game_players(player_id);
-create table public.settlements (
- id uuid primary key default gen_random_uuid(), homegame_id uuid not null, game_id uuid not null,
- from_player_id uuid not null, to_player_id uuid not null,
- from_player_name_snapshot text not null, to_player_name_snapshot text not null,
- amount_cents bigint not null check(amount_cents>0), check(from_player_id<>to_player_id),
- foreign key(game_id,homegame_id) references public.games(id,homegame_id) on delete cascade,
- foreign key(game_id,from_player_id) references public.game_players(game_id,player_id) on delete cascade,
- foreign key(game_id,to_player_id) references public.game_players(game_id,player_id) on delete cascade,
- unique(game_id,from_player_id,to_player_id)
-);
-create index settlements_group on public.settlements(homegame_id);
-create function private.is_member(h uuid) returns boolean language sql stable security definer set search_path='' as $$
- select exists(select 1 from public.homegame_members where homegame_id=h and user_id=auth.uid());
-$$;
-grant usage on schema private to authenticated;
-grant execute on function private.is_member(uuid) to authenticated;
--- No direct writes: RPCs below validate membership, lock parent rows, and preserve invariants.
-alter table public.homegames enable row level security;
-alter table public.homegame_members enable row level security;
-alter table public.players enable row level security;
-alter table public.games enable row level security;
-alter table public.game_players enable row level security;
-alter table public.settlements enable row level security;
-alter table private.invites enable row level security;
-create policy member_read on public.homegames for select to authenticated using(private.is_member(id));
-create policy self_read on public.homegame_members for select to authenticated using(user_id=auth.uid());
-create policy member_read on public.players for select to authenticated using(private.is_member(homegame_id));
-create policy member_read on public.games for select to authenticated using(private.is_member(homegame_id));
-create policy member_read on public.game_players for select to authenticated using(private.is_member(homegame_id));
-create policy member_read on public.settlements for select to authenticated using(private.is_member(homegame_id));
-revoke all on public.homegames,public.homegame_members,public.players,public.games,public.game_players,public.settlements from anon,authenticated;
-grant select on public.homegames,public.homegame_members,public.players,public.games,public.game_players,public.settlements to authenticated;
-
-create function public.create_homegame(p_name text) returns uuid language plpgsql security definer set search_path='' as $$
-declare h uuid;
-begin
- if auth.uid() is null then raise exception 'Sign in first'; end if;
- insert into public.homegames(name,created_by) values(btrim(p_name),auth.uid()) returning id into h;
- insert into public.homegame_members values(h,auth.uid(),now());
- insert into private.invites(homegame_id) values(h);
- return h;
-end $$;
-create function public.join_homegame_by_code(p_code text) returns uuid language plpgsql security definer set search_path='' as $$
-declare h uuid;
-begin
- if auth.uid() is null then raise exception 'Sign in first'; end if;
- select homegame_id into h from private.invites where code=upper(regexp_replace(p_code,'[\s-]','','g'));
- if h is null then raise exception 'Invite code not found. Check it with your friend.'; end if;
- insert into public.homegame_members(homegame_id,user_id) values(h,auth.uid()) on conflict(homegame_id,user_id) do nothing;
- return h;
-end $$;
-create function public.get_invite_code(p_homegame uuid) returns text language plpgsql security definer set search_path='' as $$
-begin
- if not private.is_member(p_homegame) then raise exception 'Not a member'; end if;
- return (select code from private.invites where homegame_id=p_homegame);
-end $$;
-create function public.save_player(p_homegame uuid,p_name text,p_id uuid default null,p_archived boolean default false) returns uuid language plpgsql security definer set search_path='' as $$
-declare result uuid;
-begin
- if not private.is_member(p_homegame) then raise exception 'Not a member'; end if;
- if p_id is null then
- insert into public.players(homegame_id,name) values(p_homegame,regexp_replace(btrim(p_name),'\s+',' ','g')) returning id into result;
- else
- update public.players set name=regexp_replace(btrim(p_name),'\s+',' ','g'),archived=p_archived where id=p_id and homegame_id=p_homegame returning id into result;
- if result is null then raise exception 'Player not found'; end if;
+alter table public.games add column if not exists buy_in_mode text not null default 'fixed';
+alter table public.games add column if not exists buy_in_value_cents bigint default 1500;
+alter table public.game_players add column if not exists amount_in_cents bigint;
+alter table public.game_players add column if not exists result_entry_mode text not null default 'final_chips';
+alter table public.game_players add column if not exists result_entry_cents bigint;
+alter table public.game_players add column if not exists input_revision integer not null default 0;
+alter table public.game_players alter column buy_ins drop not null;
+alter table public.game_players alter column final_chips_cents drop not null;
+alter table public.game_players alter column final_chips_cents drop default;
+update public.game_players set amount_in_cents=coalesce(amount_paid_cents,buy_ins*1500) where amount_in_cents is null;
+update public.game_players set result_entry_cents=final_chips_cents where result_entry_cents is null and final_chips_cents is not null;
+alter table public.game_players alter column amount_in_cents set not null;
+alter table public.game_players alter column amount_in_cents set default 0;
+do $$ begin
+ if not exists(select 1 from pg_constraint where conrelid='public.games'::regclass and conname='game_buy_in_mode') then
+ alter table public.games add constraint game_buy_in_mode check((buy_in_mode='fixed' and buy_in_value_cents is not null and buy_in_value_cents between 1 and 100000000) or (buy_in_mode='flexible' and buy_in_value_cents is null));
  end if;
- update public.homegames set revision=revision+1 where id=p_homegame;
- return result;
+ if not exists(select 1 from pg_constraint where conrelid='public.game_players'::regclass and conname='player_entry_valid') then
+ alter table public.game_players add constraint player_entry_valid check(amount_in_cents between 0 and 100000000 and result_entry_mode in ('final_chips','net_pl') and (result_entry_cents is null or result_entry_cents between -100000000 and 100000000));
+ end if;
 end $$;
+
 -- Derived fields cannot drift, even inside RPCs. Parent settings are immutable.
 create or replace function private.derive_game_player() returns trigger language plpgsql set search_path='' as $$
 declare g public.games;
@@ -146,6 +49,8 @@ end $$;
 drop trigger if exists immutable_buy_in_mode on public.games;
 create trigger immutable_buy_in_mode before update on public.games for each row execute function private.immutable_buy_in_mode();
 
+-- Replace only the old function signature; no table or data is dropped.
+drop function if exists public.start_game(uuid,text,date,uuid[]);
 create or replace function public.start_game(p_homegame uuid,p_name text,p_date date,p_players uuid[],p_buy_in_mode text default 'fixed',p_buy_in_value_cents bigint default 1500) returns uuid language plpgsql security definer set search_path='' as $$
 declare g uuid;
 begin
@@ -258,32 +163,6 @@ begin
  update public.homegames set revision=revision+1 where id=g.homegame_id;
 end $$;
 
-create function public.delete_game(p_game uuid,p_revision integer) returns void language plpgsql security definer set search_path='' as $$
-declare g public.games;
-begin
- select * into g from public.games where id=p_game for update;
- if not private.is_member(g.homegame_id) then raise exception 'Not a member'; end if;
- if g.revision is distinct from p_revision then raise exception 'Game changed. Reload before deleting.'; end if;
- delete from public.games where id=p_game;
- update public.homegames set revision=revision+1 where id=g.homegame_id;
-end $$;
--- PostgreSQL grants PUBLIC execute by default; explicitly restrict every app RPC.
-revoke all on function private.is_member(uuid) from public,anon;
-revoke all on function public.create_homegame(text),public.join_homegame_by_code(text),public.get_invite_code(uuid),public.save_player(uuid,text,uuid,boolean),public.start_game(uuid,text,date,uuid[],text,bigint),public.update_game_input(uuid,uuid,integer,bigint,bigint),public.complete_game(uuid,integer,text,date,jsonb,jsonb),public.delete_game(uuid,integer) from public,anon;
-grant execute on function public.create_homegame(text),public.join_homegame_by_code(text),public.get_invite_code(uuid),public.save_player(uuid,text,uuid,boolean),public.start_game(uuid,text,date,uuid[],text,bigint),public.update_game_input(uuid,uuid,integer,bigint,bigint),public.complete_game(uuid,integer,text,date,jsonb,jsonb),public.delete_game(uuid,integer) to authenticated;
-create function public.get_homegame_data(p_homegame uuid) returns jsonb language plpgsql stable security invoker set search_path='' as $$
-begin
- if not private.is_member(p_homegame) then raise exception 'Not a member'; end if;
- return jsonb_build_object(
- 'players',coalesce((select jsonb_agg(p order by p.name) from public.players p where homegame_id=p_homegame),'[]'::jsonb),
- 'games',coalesce((select jsonb_agg(g order by g.game_date desc,g.created_at desc) from public.games g where homegame_id=p_homegame),'[]'::jsonb),
- 'game_players',coalesce((select jsonb_agg(p order by p.player_id) from public.game_players p where homegame_id=p_homegame),'[]'::jsonb),
- 'settlements',coalesce((select jsonb_agg(s order by s.from_player_id,s.to_player_id) from public.settlements s where homegame_id=p_homegame),'[]'::jsonb));
-end $$;
-revoke all on function public.get_homegame_data(uuid) from public,anon;
-grant execute on function public.get_homegame_data(uuid) to authenticated;
--- Only parent change signals are needed: input RPCs bump games.revision.
-alter publication supabase_realtime add table public.homegames,public.games;
 revoke all on function private.derive_game_player(),private.immutable_buy_in_mode() from public,anon,authenticated;
 revoke all on function public.start_game(uuid,text,date,uuid[],text,bigint),public.save_game_entry(uuid,uuid,integer,bigint,text,bigint,boolean),public.leave_homegame(uuid),public.delete_homegame(uuid) from public,anon;
 grant execute on function public.start_game(uuid,text,date,uuid[],text,bigint),public.save_game_entry(uuid,uuid,integer,bigint,text,bigint,boolean),public.leave_homegame(uuid),public.delete_homegame(uuid) to authenticated;

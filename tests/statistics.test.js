@@ -69,7 +69,7 @@ test("backup excludes active game and membership/invite secrets", () => {
     { id: "h", name: "Table", invite_code: "secret" },
     data,
   );
-  assert.equal(b.schemaVersion, 2);
+  assert.equal(b.schemaVersion, 3);
   assert.equal(b.games.length, 2);
   assert.equal(b.game_players.length, 2);
   assert.equal(b.settlements.length, 1);
